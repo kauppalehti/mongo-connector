@@ -318,6 +318,25 @@ class OplogThread(threading.Thread):
 
         return entry
 
+    def get_namespace_regex(self):
+        first_namespace = True
+        namespace_regex = "^("
+
+        for namespace_candidate in self.namespace_set:
+            if not first_namespace:
+                namespace_regex += "|"
+
+            if "." in namespace_candidate:
+                namespace_regex += namespace_candidate
+            else:
+                namespace_regex += namespace_candidate + "\\..+"
+            first_namespace = False
+
+        namespace_regex += ")"
+
+        logging.debug("OplogThread: Namespace regex: " + namespace_regex)
+        return namespace_regex
+
     def get_oplog_cursor(self, timestamp):
         """Move cursor to the proper place in the oplog.
         """
@@ -341,7 +360,7 @@ class OplogThread(threading.Thread):
                 else:
                     cursor = self.oplog.find(
                         {'ts': {'$gte': timestamp},
-                         'ns': {'$in': self.namespace_set}},
+                         'ns': {'$regex': self.get_namespace_regex()}},
                         tailable=True, await_data=True
                     )
                 # Applying 8 as the mask to the cursor enables OplogReplay
@@ -389,24 +408,41 @@ class OplogThread(threading.Thread):
         configs i.e. when we're starting for the first time.
         """
 
-        dump_set = self.namespace_set or []
+        dump_set = []
+
+        db_list = retry_until_ok(self.main_connection.database_names)
+        for database in db_list:
+            if database == "config" or database == "local":
+                continue
+
+            if self.namespace_set:
+                found_matching_database_name = False
+                for namespace_candidate in self.namespace_set:
+                    if "." in namespace_candidate:
+                        continue
+                    if namespace_candidate == database:
+                        found_matching_database_name = True
+                        break
+                if not found_matching_database_name:
+                    continue
+
+            coll_list = retry_until_ok(
+                self.main_connection[database].collection_names)
+            for coll in coll_list:
+                if coll.startswith("system"):
+                    continue
+                namespace = "%s.%s" % (database, coll)
+                dump_set.append(namespace)
+
+        if self.namespace_set:
+            for namespace_candidate in self.namespace_set:
+                if "." in namespace_candidate:
+                    dump_set.append(namespace_candidate)
+
         logging.debug("OplogThread: Dumping set of collections %s " % dump_set)
 
-        #no namespaces specified
-        if not self.namespace_set:
-            db_list = retry_until_ok(self.main_connection.database_names)
-            for database in db_list:
-                if database == "config" or database == "local":
-                    continue
-                coll_list = retry_until_ok(
-                    self.main_connection[database].collection_names)
-                for coll in coll_list:
-                    if coll.startswith("system"):
-                        continue
-                    namespace = "%s.%s" % (database, coll)
-                    dump_set.append(namespace)
-
         timestamp = util.retry_until_ok(self.get_last_oplog_timestamp)
+        logging.debug("OplogThread: get_last_oplog_timestamp: " + str(timestamp))
         if timestamp is None:
             return None
         long_ts = util.bson_ts_to_long(timestamp)
@@ -549,7 +585,7 @@ class OplogThread(threading.Thread):
             ).limit(1)
         else:
             curr = self.oplog.find(
-                {'ns': {'$in': self.namespace_set}}
+                {'ns': {'$regex': self.get_namespace_regex()}}
             ).sort('$natural', pymongo.DESCENDING).limit(1)
 
         if curr.count(with_limit_and_skip=True) == 0:
